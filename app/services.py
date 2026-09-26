@@ -71,6 +71,31 @@ def content_hash(roll_no: str, start: int, end: int, frames: list[int]) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def content_hash_ranges(
+    roll_no: str,
+    expected_ranges: list[tuple[int, int]],
+    frames: list[int],
+) -> str:
+    """支持多段预期覆盖的内容指纹（补扫批次有效覆盖可含多段、保留空洞）。
+
+    单段时仍走 :func:`content_hash` 的旧口径（start/end 键），保证普通批次、
+    单段补扫批次的幂等指纹与历史数据完全一致；多段时使用 ranges 键序列化
+    （键名与单段载荷不同，两种指纹不会碰撞）。调用方传入的段应为已规范化的
+    互不相邻闭区间，指纹对段排序稳定。
+    """
+    ranges = merge_intervals(expected_ranges)
+    if len(ranges) == 1:
+        s, e = ranges[0]
+        return content_hash(roll_no, s, e, frames)
+    payload = json.dumps(
+        {"roll_no": roll_no, "ranges": [[s, e] for s, e in ranges],
+         "frames": sorted(set(frames))},
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def merge_intervals(intervals: list[tuple[int, int]]) -> list[tuple[int, int]]:
     """合并重叠或相邻的闭区间，例如 [(1,5),(5,8)] -> [(1,8)]。"""
     if not intervals:
@@ -236,7 +261,7 @@ def _all_frames(conn: sqlite3.Connection, roll_no: str) -> set[int]:
 def _batch_metas(conn: sqlite3.Connection, roll_no: str) -> list[schemas.BatchMeta]:
     rows = conn.execute(
         """SELECT id, expected_start, expected_end, frames_json, raw_frames_json,
-                  frames_merged_json, duplicates_json, created_at
+                  expected_ranges_json, frames_merged_json, duplicates_json, created_at
              FROM batches WHERE roll_no = ? ORDER BY created_at, rowid""",
         (roll_no,),
     ).fetchall()
@@ -247,12 +272,26 @@ def _batch_metas(conn: sqlite3.Connection, roll_no: str) -> list[schemas.BatchMe
             expected_end=r["expected_end"],
             # 新批次保留原始帧列表（含批内重复、保序）；旧库迁移来的批次退回去重集合
             frames=json.loads(r["raw_frames_json"] or r["frames_json"]),
+            expected_ranges=_batch_expected_ranges(r),
             added_frames=json.loads(r["frames_merged_json"]),
             duplicates=json.loads(r["duplicates_json"]),
             created_at=r["created_at"],
         )
         for r in rows
     ]
+
+
+def _batch_expected_ranges(r: sqlite3.Row) -> list[tuple[int, int]]:
+    """读取一个批次行的有效预期覆盖。
+
+    ``expected_ranges_json`` 非 NULL（多段补扫批次，段间空洞必须保留）时以其
+    段列表为准；NULL 表示普通批次或旧库批次，按 expected_start/expected_end
+    单段闭区间解释（“旧库批次仍按原起止解释”）。
+    """
+    stored = r["expected_ranges_json"] if "expected_ranges_json" in r.keys() else None
+    if stored is not None:
+        return [tuple(seg) for seg in json.loads(stored)]
+    return [(r["expected_start"], r["expected_end"])]
 
 
 def _state_from_db(conn: sqlite3.Connection, roll_no: str) -> dict:
@@ -408,21 +447,32 @@ def _bump_batch_revision(conn: sqlite3.Connection, roll_no: str) -> int:
 def _import_batch_tx(
     conn: sqlite3.Connection,
     roll_no: str,
-    expected_start: int,
-    expected_end: int,
+    expected_ranges: list[tuple[int, int]] | tuple[int, int],
     frames_in: list[int],
     batch_id: str,
 ) -> tuple[str, list[int], list[int]]:
     """在**已开启的写事务内**导入一个批次（批次提交与补扫回执共用）。
 
-    调用方须先持有 BEGIN IMMEDIATE 事务。返回 (batch_id, 新增帧, 重复帧)。
-    若显式 batch_id 已被其他内容占用，抛 BatchIdConflictError（由调用方回滚）。
-    实际写入新批次后会在同一事务内把该胶卷批次修订号 +1
-    （见 ``_bump_batch_revision``）；内容幂等重试由调用方提前短路，不走到本函数。
+    调用方须先持有 BEGIN IMMEDIATE 事务。``expected_ranges`` 可为 (start, end)
+    单段，或已规范化的多段闭区间列表（补扫批次的有效覆盖，段间空洞原样保留）。
+    返回 (batch_id, 新增帧, 重复帧)。若显式 batch_id 已被其他内容占用，抛
+    BatchIdConflictError（由调用方回滚）。实际写入新批次后会在同一事务内把该
+    胶卷批次修订号 +1（见 ``_bump_batch_revision``）；内容幂等重试由调用方
+    提前短路，不走到本函数。
     """
+    if expected_ranges and isinstance(expected_ranges[0], tuple):
+        ranges = merge_intervals(list(expected_ranges))
+    else:
+        ranges = [(expected_ranges[0], expected_ranges[1])]
+    expected_start = ranges[0][0]
+    expected_end = ranges[-1][1]
+    multi_segment = len(ranges) > 1
+    # 多段覆盖以段列表持久化；单段保持 NULL，旧库与普通批次仍按起止单段解释
+    ranges_json = json.dumps([[s, e] for s, e in ranges]) if multi_segment else None
+
     frames = sorted(set(frames_in))
     raw_frames = list(frames_in)  # 保留原始帧列表（含批内重复、保序），供撤销时重建
-    digest = content_hash(roll_no, expected_start, expected_end, frames)
+    digest = content_hash_ranges(roll_no, ranges, frames)
 
     # batch_id 若已被不同内容占用则拒绝（409 在 main 中处理）
     clash = conn.execute(
@@ -448,8 +498,9 @@ def _import_batch_tx(
     conn.execute(
         """INSERT INTO batches
            (id, roll_no, expected_start, expected_end, frames_json,
-            raw_frames_json, frames_merged_json, duplicates_json, content_hash)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            raw_frames_json, expected_ranges_json, frames_merged_json,
+            duplicates_json, content_hash)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             batch_id,
             roll_no,
@@ -457,14 +508,16 @@ def _import_batch_tx(
             expected_end,
             json.dumps(frames),
             json.dumps(raw_frames),
+            ranges_json,
             json.dumps(new_frames),
             json.dumps(duplicates),
             digest,
         ),
     )
-    conn.execute(
+    # 有效覆盖逐段聚合（多段空洞不会被填平）；roll_expected 主键天然去重
+    conn.executemany(
         "INSERT OR IGNORE INTO roll_expected (roll_no, start_no, end_no) VALUES (?, ?, ?)",
-        (roll_no, expected_start, expected_end),
+        [(roll_no, s, e) for s, e in ranges],
     )
     conn.executemany(
         "INSERT OR IGNORE INTO roll_frames (roll_no, frame_no, batch_id) VALUES (?, ?, ?)",
@@ -506,8 +559,7 @@ def submit_batch(conn: sqlite3.Connection, data: schemas.BatchIn) -> tuple[schem
         batch_id, new_frames, duplicates = _import_batch_tx(
             conn,
             data.roll_no,
-            data.expected_start,
-            data.expected_end,
+            (data.expected_start, data.expected_end),
             data.frames,
             batch_id,
         )
@@ -762,8 +814,7 @@ def confirm_precheck(
             batch_id, new_frames, duplicates = _import_batch_tx(
                 conn,
                 pc["roll_no"],
-                pc["expected_start"],
-                pc["expected_end"],
+                (pc["expected_start"], pc["expected_end"]),
                 raw_frames,
                 batch_id,
             )
@@ -868,7 +919,8 @@ def delete_batch(conn: sqlite3.Connection, batch_id: str) -> None:
         roll_no = target["roll_no"]
 
         remaining = conn.execute(
-            """SELECT id, expected_start, expected_end, raw_frames_json
+            """SELECT id, expected_start, expected_end, raw_frames_json,
+                      expected_ranges_json
                  FROM batches
                 WHERE roll_no = ? AND id != ?
                 ORDER BY created_at, rowid""",
@@ -911,9 +963,17 @@ def delete_batch(conn: sqlite3.Connection, batch_id: str) -> None:
             conn.execute("COMMIT")
             return
 
+        # 按各存活批次的有效覆盖逐段重建：旧批次（无 expected_ranges_json）
+        # 仍按原 expected_start/expected_end 单段解释；多段补扫批次原样还原
+        # 全部段，段间空洞绝不因撤销重建而被填平（roll_expected 主键去重）
+        expected_segments = [
+            (roll_no, s, e)
+            for r in remaining
+            for s, e in _batch_expected_ranges(r)
+        ]
         conn.executemany(
             "INSERT OR IGNORE INTO roll_expected (roll_no, start_no, end_no) VALUES (?, ?, ?)",
-            [(roll_no, r["expected_start"], r["expected_end"]) for r in remaining],
+            expected_segments,
         )
 
         owned: set[int] = set()  # 按原导入顺序，此前批次已扫到的帧
@@ -972,7 +1032,7 @@ def get_batch_quality(
     try:
         r = conn.execute(
             """SELECT id, roll_no, expected_start, expected_end,
-                      raw_frames_json, created_at
+                      raw_frames_json, expected_ranges_json, created_at
                  FROM batches WHERE id = ?""",
             (batch_id,),
         ).fetchone()
@@ -991,16 +1051,19 @@ def get_batch_quality(
             else 0.0
         )
 
-        exp_start, exp_end = r["expected_start"], r["expected_end"]
+        # 有效覆盖可含多段（补扫批次）：越界与缺口均按段列表计算；
+        # 旧/普通批次 expected_ranges_json 为 NULL，即单段 [start, end]
+        exp_ranges = _batch_expected_ranges(r)
+        exp_start, exp_end = exp_ranges[0][0], exp_ranges[-1][1]
         out_of_range = sorted(
-            f for f in unique if not (exp_start <= f <= exp_end)
+            f for f in unique if not _frame_in_intervals(f, exp_ranges)
         )
 
         # 按原始顺序压缩连续段：段数与最长连续扫到段（并列取先出现者）
         segments = raw_list_segments(raw_frames)
         longest_run = max(segments, key=lambda seg: seg[1] - seg[0], default=None)
-        # 预期闭区间内的缺帧段：最长缺口（并列取帧号最小者）
-        gaps = missing_intervals([(exp_start, exp_end)], unique)
+        # 预期覆盖内的缺帧段：最长缺口（并列取帧号最小者）
+        gaps = missing_intervals(exp_ranges, unique)
         longest_gap = max(gaps, key=lambda seg: seg[1] - seg[0], default=None)
         longest_gap_length = (
             longest_gap[1] - longest_gap[0] + 1 if longest_gap else 0
@@ -1240,10 +1303,11 @@ def _receipt_out(
 ) -> schemas.RescanReceiptOut:
     """组装回执响应：remaining 为认领帧段与当前缺帧区间的交集（结案后仍可缩短）。
 
-    added_frames / duplicates 恒取回执落库时冻结的快照（rescan_receipts 表），
-    不回查 batches 表：回执批次被撤销后其 batch_id 可能被普通批次复用，
-    按编号回查会把新批次的明细错装到旧回执上。快照列自回执表引入起即为
-    NOT NULL，历史回执均带快照，直接读取不影响既有持久化数据。
+    added_frames / duplicates / expected_ranges 恒取回执落库时冻结的快照
+    （rescan_receipts 表），不回查 batches 表：回执批次被撤销后其 batch_id
+    可能被普通批次复用，按编号回查会把新批次的明细/覆盖错装到旧回执上。
+    快照列自回执表引入起即为 NOT NULL（旧库迁移时按认领闭区间回填单段），
+    直接读取不影响既有持久化数据。
     """
     st = _state_from_db(conn, claim["roll_no"])
     remaining = intersect_intervals(
@@ -1252,6 +1316,7 @@ def _receipt_out(
     raw_frames = json.loads(receipt["raw_frames_json"])
     added_frames = json.loads(receipt["added_frames_json"])
     duplicates = json.loads(receipt["duplicates_json"])
+    stored_ranges = json.loads(receipt["expected_ranges_json"])
     return schemas.RescanReceiptOut(
         id=receipt["id"],
         claim_id=claim["id"],
@@ -1261,6 +1326,7 @@ def _receipt_out(
         frame_end=claim["frame_end"],
         batch_id=receipt["batch_id"],
         frames=raw_frames,
+        expected_ranges=stored_ranges,
         added_frames=added_frames,
         duplicates=duplicates,
         repeated=repeated,
@@ -1274,23 +1340,28 @@ def submit_rescan_receipt(
 ) -> tuple[schemas.RescanReceiptOut, int]:
     """提交补扫完成回执，返回 (回执, 201首次 / 200幂等重试)。
 
-    全部动作在同一 BEGIN IMMEDIATE 写事务内完成：以认领闭区间作为补扫批次
-    的预期范围导入批次、持久化回执、将认领置为已结案；任一步失败整体回滚，
-    数据不变。校验规则：
+    全部动作在同一 BEGIN IMMEDIATE 写事务内完成：以**认领闭区间与提交时胶卷
+    当前预期覆盖的交集**作为补扫批次的有效覆盖（交集可含多段，原样持久化、
+    保留空洞，后续撤销其他批次重建时也不填平）导入批次、持久化回执、将认领
+    置为已结案；任一步失败整体回滚，数据不变。这样认领后若有批次被撤销导致
+    预期覆盖收缩（例如认领 [2,9]、覆盖缩为 [3,4]∪[7,9]），提交回执只会在
+    交集 [3,4]∪[7,9] 内补扫，绝不再把覆盖错误扩回整个认领区间。校验规则：
 
     - 认领记录不存在 → ClaimNotFoundError（404）；
     - 已到期或已释放 → ClaimUnavailableError（409）。到期判定时间在
       **BEGIN IMMEDIATE 成功（拿到写锁）之后**取，并在同一写事务内复核：
       即使请求在锁等待期间越过 expires_at（写锁被其他事务占用超过 TTL），
       过期回执也一律 409 拒绝，批次、回执与认领结案状态均不变；
-    - 每帧必须落在认领闭区间 [frame_start, frame_end] 内，且提交时仍属于
-      该胶卷缺帧 → ReceiptConflictError（409）；
-    - 相同认领、batch_id、原始帧列表的重试：即使认领已到期也原样返回已存
-      回执（200），不重复导入、不改变结案状态（幂等重试优先于到期判定）；
+    - 有效覆盖 = 认领闭区间 ∩ 当前预期覆盖；每帧必须落在该交集内，且提交时
+      仍属于该胶卷缺帧（未被其他批次扫到），否则 ReceiptConflictError（409），
+      批次、回执、认领与批次修订号均不变；
+    - 相同认领、batch_id、原始帧列表的重试：即使认领已到期、即使交集随后
+      变化（覆盖又收缩/恢复），也原样返回已存回执（200），不重复导入、
+      不改变结案状态（幂等重试优先于到期与覆盖判定）；
     - 内容变更（batch_id 或原始帧列表不同）、对已结案认领再提交新回执、
       batch_id 已被其他回执/批次占用 → ReceiptConflictError（409）。
 
-    部分补扫时只导入实际扫到的帧，认领结案后帧段内剩余缺帧不再被其占用，
+    部分补扫时只导入实际扫到的帧，认领结案后交集内剩余缺帧不再被其占用，
     立即可被其他人重新认领。
     """
     claim_id = claim_id.strip()
@@ -1311,7 +1382,7 @@ def submit_rescan_receipt(
 
         # 认领存在后先统一校验帧号边界（非法值 422）：必须在幂等比对、
         # 缺帧集合计算与批次写库之前拒绝布尔值、浮点、负数或超出
-        # SQLite INTEGER 范围的帧号；预期范围即认领闭区间（本就合法）
+        # SQLite INTEGER 范围的帧号；以认领闭区间作为校验上界（交集是其子集）
         _validate_frame_inputs(
             claim["frame_start"], claim["frame_end"], frames_in
         )
@@ -1320,8 +1391,9 @@ def submit_rescan_receipt(
             "SELECT * FROM rescan_receipts WHERE claim_id = ?", (claim_id,)
         ).fetchone()
 
-        # 幂等优先于到期判定：已落库的回执不因认领到期而改变重试结果，
-        # 相同认领 + 相同 batch_id + 相同原始帧列表 → 回已存回执（200）
+        # 幂等优先于到期与覆盖判定：已落库的回执不因认领到期或覆盖变化而
+        # 改变重试结果，相同认领 + 相同 batch_id + 相同原始帧列表 → 回已存
+        # 回执（200，覆盖快照仍为落库时的交集）
         if existing_receipt is not None:
             if (
                 existing_receipt["batch_id"] == batch_id
@@ -1339,20 +1411,27 @@ def submit_rescan_receipt(
         if claim["expires_at"] <= now:
             raise ClaimUnavailableError("补扫任务已到期")
 
-        # 帧号须在认领闭区间内
-        out_of_claim = [
-            f
-            for f in set(frames_in)
-            if not (claim["frame_start"] <= f <= claim["frame_end"])
-        ]
-        if out_of_claim:
+        # 有效覆盖：认领闭区间 ∩ 提交时胶卷当前预期覆盖（拿锁后读取，与后续
+        # 导入同一写事务）。交集可含多段，段间空洞即已被撤销出覆盖的帧，
+        # 补扫批次绝不再覆盖这些空洞。
+        current_expected = _expected_ranges(conn, claim["roll_no"])
+        effective_coverage = intersect_intervals(
+            current_expected, [(claim["frame_start"], claim["frame_end"])]
+        )
+
+        # 帧号须在有效覆盖（交集）内；交集中的空洞（如被撤销出覆盖的帧）拒收
+        frame_set = set(frames_in)
+        out_of_coverage = sorted(
+            f for f in frame_set if not _frame_in_intervals(f, effective_coverage)
+        )
+        if out_of_coverage:
             raise ReceiptConflictError(
-                f"帧号超出认领区间 [{claim['frame_start']}, {claim['frame_end']}]: "
-                + ", ".join(map(str, sorted(out_of_claim)))
+                "帧号不在认领区间与当前预期覆盖的交集内: "
+                + ", ".join(map(str, out_of_coverage))
             )
 
         # 提交时每帧仍须属于该胶卷缺帧（未被其他批次扫到）
-        already = sorted(set(frames_in) & _all_frames(conn, claim["roll_no"]))
+        already = sorted(frame_set & _all_frames(conn, claim["roll_no"]))
         if already:
             raise ReceiptConflictError(
                 "以下帧已不属于该胶卷缺帧（已被扫到）: " + ", ".join(map(str, already))
@@ -1367,12 +1446,11 @@ def submit_rescan_receipt(
                 f"batch_id '{batch_id}' 已用于其他补扫回执"
             )
 
-        # 同一写事务内：以认领闭区间作为批次预期范围导入补扫批次
+        # 同一写事务内：以交集（可多段）作为批次有效覆盖导入补扫批次
         _, new_frames, duplicates = _import_batch_tx(
             conn,
             claim["roll_no"],
-            claim["frame_start"],
-            claim["frame_end"],
+            effective_coverage,
             frames_in,
             batch_id,
         )
@@ -1381,20 +1459,21 @@ def submit_rescan_receipt(
         conn.execute(
             """INSERT INTO rescan_receipts
                    (id, claim_id, roll_no, batch_id, raw_frames_json,
-                    added_frames_json, duplicates_json, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    expected_ranges_json, added_frames_json, duplicates_json, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 receipt_id,
-                claim_id,
+                claim["id"],
                 claim["roll_no"],
                 batch_id,
                 json.dumps(frames_in),
+                json.dumps([list(x) for x in effective_coverage]),
                 json.dumps(new_frames),
                 json.dumps(duplicates),
                 now,
             ),
         )
-        # 认领结案：帧段中剩余缺帧立即让出，可被重新认领
+        # 认领结案：交集内剩余缺帧立即让出，可被重新认领
         conn.execute(
             "UPDATE rescan_claims SET completed_at = ? WHERE id = ?",
             (now, claim_id),

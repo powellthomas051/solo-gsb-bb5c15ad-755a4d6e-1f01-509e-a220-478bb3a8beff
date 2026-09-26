@@ -35,6 +35,11 @@ CREATE TABLE IF NOT EXISTS batches (
     expected_end    INTEGER NOT NULL,
     frames_json     TEXT NOT NULL,
     raw_frames_json TEXT,
+    -- 补扫批次的**有效预期覆盖**（提交回执时“认领闭区间 ∩ 胶卷当前预期覆盖”，
+    -- 可含多段，原样持久化、保留空洞）：NULL 表示按 expected_start/expected_end
+    -- 单段解释（普通批次与旧库批次均如此）；非 NULL 时为 [[s,e],...] 段列表，
+    -- expected_start/expected_end 仅存首段起点与末段终点，真实覆盖以此列为准。
+    expected_ranges_json TEXT,
     frames_merged_json TEXT NOT NULL DEFAULT '[]',
     duplicates_json TEXT NOT NULL DEFAULT '[]',
     content_hash    TEXT NOT NULL,
@@ -85,6 +90,9 @@ CREATE TABLE IF NOT EXISTS rescan_receipts (
     roll_no           TEXT NOT NULL,
     batch_id          TEXT NOT NULL,
     raw_frames_json   TEXT NOT NULL,
+    -- 回执落库时补扫批次的有效覆盖（认领闭区间 ∩ 提交时当前预期覆盖，可含多段），
+    -- 随回执冻结：批次撤销或其 batch_id 被复用后，重放回执仍返回原覆盖而非回查 batches
+    expected_ranges_json TEXT NOT NULL DEFAULT '[]',
     added_frames_json TEXT NOT NULL,
     duplicates_json   TEXT NOT NULL,
     created_at        TEXT NOT NULL
@@ -196,6 +204,10 @@ def init_db() -> None:
     旧版 import_prechecks 没有 batch_revision 列，同样幂等补齐；列补齐后旧
     预检单该值为 NULL，确认时据此判定：未确认旧预检返回 409 要求重新预检，
     已确认旧预检仍按冻结结果返回（详见 services.confirm_precheck）。
+    旧版 batches / rescan_receipts 没有 expected_ranges_json 列，同样幂等
+    补齐：旧批次按 expected_start/expected_end 单段解释（列保持 NULL），
+    旧回执按认领闭区间回填单段覆盖（详见 services.submit_rescan_receipt）。
+    所有 ALTER 均以 PRAGMA table_info 探测后执行，重复启动安全。
     """
     conn = _connect()
     try:
@@ -203,6 +215,8 @@ def init_db() -> None:
         cols = {r["name"] for r in conn.execute("PRAGMA table_info(batches)").fetchall()}
         if "raw_frames_json" not in cols:
             conn.execute("ALTER TABLE batches ADD COLUMN raw_frames_json TEXT")
+        if "expected_ranges_json" not in cols:
+            conn.execute("ALTER TABLE batches ADD COLUMN expected_ranges_json TEXT")
         claim_cols = {
             r["name"] for r in conn.execute("PRAGMA table_info(rescan_claims)").fetchall()
         }
@@ -213,6 +227,21 @@ def init_db() -> None:
         }
         if "batch_revision" not in precheck_cols:
             conn.execute("ALTER TABLE import_prechecks ADD COLUMN batch_revision INTEGER")
+        receipt_cols = {
+            r["name"] for r in conn.execute("PRAGMA table_info(rescan_receipts)").fetchall()
+        }
+        if "expected_ranges_json" not in receipt_cols:
+            # 旧回执的有效覆盖即其认领闭区间（单段 [[s,e]]）；原样回填，重放返回值不变
+            conn.execute("ALTER TABLE rescan_receipts ADD COLUMN expected_ranges_json TEXT")
+            conn.execute(
+                """UPDATE rescan_receipts AS r
+                      SET expected_ranges_json = (
+                            SELECT json_array(json_array(c.frame_start, c.frame_end))
+                              FROM rescan_claims AS c
+                             WHERE c.id = r.claim_id
+                          )
+                    WHERE expected_ranges_json IS NULL"""
+            )
     finally:
         conn.close()
 

@@ -380,6 +380,11 @@ class BatchMeta(BaseModel):
     expected_start: int
     expected_end: int
     frames: list[int]
+    expected_ranges: list[list[int]] = Field(
+        ...,
+        description="该批有效预期覆盖闭区间（可含多段，段间空洞原样保留）；"
+        "普通批次与旧库批次为单段 [expected_start, expected_end]",
+    )
     added_frames: list[int]
     duplicates: list[int]
     created_at: str
@@ -532,6 +537,11 @@ class RescanReceiptOut(BaseModel):
     batch_id: str = Field(..., description="本次补扫导入的批次号")
     frames: list[int] = Field(
         ..., description="提交的原始帧列表（含批内重复，保序）"
+    )
+    expected_ranges: list[list[int]] = Field(
+        ...,
+        description="补扫批次的有效预期覆盖：提交时认领闭区间与胶卷当前预期覆盖"
+        "的交集（可含多段，段间空洞原样保留）；随回执冻结，重放不随后续覆盖变化",
     )
     added_frames: list[int] = Field(..., description="本批新补齐的帧号（去重排序）")
     duplicates: list[int] = Field(
