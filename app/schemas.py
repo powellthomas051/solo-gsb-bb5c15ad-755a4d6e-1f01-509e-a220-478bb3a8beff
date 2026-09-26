@@ -131,8 +131,13 @@ class QualityAlertThresholds(BaseModel):
 class BatchQualityOut(BaseModel):
     batch_id: str
     roll_no: str
-    expected_start: int = Field(..., description="本批预期帧号起始（含）")
-    expected_end: int = Field(..., description="本批预期帧号结束（含）")
+    expected_start: int = Field(..., description="本批预期帧号起始（含）；多段覆盖时为首段起点")
+    expected_end: int = Field(..., description="本批预期帧号结束（含）；多段覆盖时为末段终点")
+    expected_ranges: list[list[int]] = Field(
+        ...,
+        description="本批的有效预期覆盖闭区间（可能为多段，段间空洞不属于该批覆盖）；"
+        "旧版批次按原起止解释为单段",
+    )
     frame_count: int = Field(..., description="原始帧列表长度（含批内重复）")
     unique_frame_count: int = Field(..., description="去重后的帧数")
     duplicate_rate: float = Field(
@@ -379,6 +384,11 @@ class BatchMeta(BaseModel):
     batch_id: str
     expected_start: int
     expected_end: int
+    expected_ranges: list[list[int]] = Field(
+        ...,
+        description="该批次自身的有效预期覆盖闭区间（补扫批次可能为多段，"
+        "段间空洞不填平）；旧版批次按原起止解释为单段",
+    )
     frames: list[int]
     added_frames: list[int]
     duplicates: list[int]
@@ -530,6 +540,12 @@ class RescanReceiptOut(BaseModel):
     frame_start: int = Field(..., description="认领帧段起始（含）")
     frame_end: int = Field(..., description="认领帧段结束（含）")
     batch_id: str = Field(..., description="本次补扫导入的批次号")
+    expected_ranges: list[list[int]] = Field(
+        ...,
+        description="该补扫批次的有效覆盖闭区间：提交回执时**认领闭区间与胶卷当前"
+        "预期覆盖的交集**，可能为多段（段间空洞原样保留、不填平）；"
+        "旧版回执退回认领闭区间单段",
+    )
     frames: list[int] = Field(
         ..., description="提交的原始帧列表（含批内重复，保序）"
     )
